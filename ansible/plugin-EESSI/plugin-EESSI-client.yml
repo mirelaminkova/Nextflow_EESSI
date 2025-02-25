@@ -58,65 +58,34 @@
 
 
 # Nextflow
-- name: Deploy Nextflow environment configuration
+- name: Ensure Nextflow wrapper script exists
   hosts: localhost
   become: true
-  gather_facts: true
   tasks:
-    - name: Copy the Nextflow EESSI initialization script to /opt
+    - name: Create Nextflow wrapper script in /opt
       copy:
-        src: files/nextflow-eessi-init.sh
-        dest: /opt/nextflow-eessi-init.sh
-        mode: '0755'
-
-    - name: Create /etc/profile.d/nextflow.sh to load the Nextflow environment
-      copy:
-        dest: /etc/profile.d/nextflow.sh
+        dest: /opt/nextflow-wrapper.sh
         content: |
           #!/bin/bash
-          # Automatically load the EESSI environment and Nextflow modules for interactive sessions.
-          if [ -f /opt/nextflow-eessi-init.sh ]; then
-              source /opt/nextflow-eessi-init.sh
+          set -e
+
+          # Ensure EESSI and Nextflow are loaded without sourcing /root/.bashrc
+          if [ -f /etc/profile.d/nextflow.sh ]; then
+              source /etc/profile.d/nextflow.sh
+          else
+              echo "ERROR: /etc/profile.d/nextflow.sh not found!"
+              exit 1
           fi
+
+          # Print Nextflow version to confirm it's working
+          nextflow -version
+
+          # Keep the process running so systemd sees it as active
+          exec sleep infinity
         mode: '0755'
 
-    - debug:
-        msg: "Nextflow environment deployed. New login shells will load Nextflow automatically."
-
-- name: Deploy and start Nextflow systemd service
-  hosts: localhost
-  become: true
-  gather_facts: true
-  tasks:
-    - name: Create Nextflow systemd service file
-      copy:
-        dest: /etc/systemd/system/nextflow.service
-        content: |
-          [Unit]
-          Description=Nextflow Environment Service
-          After=network.target
-
-          [Service]
-          Type=simple
-          # Run in a login shell so that /etc/profile.d/nextflow.sh is sourced.
-          # This command prints Nextflow version then sleeps indefinitely.
-          ExecStart=/bin/bash -l -c 'nextflow -version && sleep infinity'
-          Restart=always
-          RestartSec=30
-
-          [Install]
-          WantedBy=multi-user.target
-        mode: '0644'
-
-    - name: Reload systemd daemon
-      systemd:
-        daemon_reload: yes
-
-    - name: Enable and start Nextflow service
+    - name: Restart Nextflow systemd service
       systemd:
         name: nextflow
         enabled: yes
-        state: started
-
-    - debug:
-        msg: "Nextflow service deployed and started."
+        state: restarted
