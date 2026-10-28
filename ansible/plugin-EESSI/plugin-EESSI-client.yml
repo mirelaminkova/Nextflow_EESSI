@@ -61,6 +61,19 @@
   hosts: localhost
   become: yes
   gather_facts: yes
+  vars:
+    # SRC parameter behind the catalog item's "S3 bucket resource" field.
+    # The variable name is assumed (not recorded in this repo); rename it here
+    # if the catalog item uses a different one. Accepts `bucket`,
+    # `s3://bucket` or `s3://bucket/`.
+    nf_s3_bucket_param: "{{ src_s3_bucket | default('') }}"
+    nf_s3_bucket: "{{ nf_s3_bucket_param | trim | regex_replace('^s3://', '') | regex_replace('/+$', '') }}"
+    # Group allowed to read the generated config when it holds secrets
+    # (TES password / S3 keys). Users outside it will not get the config seeded.
+    nf_config_group: root
+    # A single backslash, for escaping values into Groovy '...' strings.
+    nf_bs: "\\"
+    nf_config_has_secrets: "{{ (src_tes_password | default('')) != '' or (src_s3_access_key_id | default('')) != '' or (src_s3_secret_access_key | default('')) != '' }}"
   tasks:
     - name: Create /etc/profile.d/eessi_nextflow.sh file
       copy:
@@ -89,9 +102,10 @@
           # Seed a per-user Nextflow config the first time, so runs automatically
           # pick up the TES (Pulsar / TESP-API) settings. ~/.nextflow is writable,
           # which Nextflow needs for plugin downloads (/etc/nextflow is not).
-          if [ ! -f "$HOME/.nextflow/config" ] && [ -f /etc/nextflow/nextflow.config ]; then
+          # The copy is private (0600): it may hold the TES password / S3 keys.
+          if [ ! -f "$HOME/.nextflow/config" ] && [ -r /etc/nextflow/nextflow.config ]; then
               mkdir -p "$HOME/.nextflow"
-              cp /etc/nextflow/nextflow.config "$HOME/.nextflow/config"
+              install -m 600 /etc/nextflow/nextflow.config "$HOME/.nextflow/config"
           fi
         mode: '0755'
         owner: root
@@ -105,14 +119,19 @@
 
     - name: Deploy Nextflow TES (TESP-API / Pulsar) connection config
       # Connects the Nextflow client to a GA4GH TES endpoint (TESP-API in front
-      # of Pulsar). Values come from SRC plugin parameters; keep the password in
-      # a secret parameter. Readable (0644) so it can be seeded into each user's
-      # ~/.nextflow/config -- on a multi-tenant node, prefer templating straight
-      # into the workspace user's home at 0600 instead.
+      # of Pulsar) and points the work directory at the S3 bucket. Values come
+      # from SRC plugin parameters; keep the TES password and S3 keys in secret
+      # parameters. When any secret is set the file is 0640 root:nf_config_group
+      # (not world-readable) and no_log keeps it out of Ansible output;
+      # otherwise it is 0644. Each user's ~/.nextflow/config is seeded from it.
+      no_log: true
       copy:
         dest: /etc/nextflow/nextflow.config
-        mode: '0644'
+        owner: root
+        group: "{{ nf_config_group }}"
+        mode: "{{ '0640' if nf_config_has_secrets | bool else '0644' }}"
         content: |
+          {% macro q(v) %}'{{ v | string | replace(nf_bs, nf_bs ~ nf_bs) | replace("'", nf_bs ~ "'") }}'{% endmacro %}
           // Managed by Ansible (Nextflow_EESSI). GA4GH TES -> Pulsar via TESP-API.
           //
           // To make TES opt-in rather than the default executor, move the
@@ -120,11 +139,8 @@
           // pipelines with `-profile tes`.
           //
           // IMPORTANT: the TES executor stages task inputs/outputs by URL, so the
-          // Nextflow work directory must live on object storage (e.g. S3/MinIO),
-          // not a local path. Launch with an object-store work dir, e.g.:
-          //     nextflow run <pipeline> -w s3://<bucket>/work
-          // and provide the matching credentials (e.g. an `aws { ... }` block).
-          // A local `-w ./work` will be rejected by TESP-API with
+          // Nextflow work directory must live on object storage (S3), not a local
+          // path. A local `-w ./work` will be rejected by TESP-API with
           // "invalid or missing URL scheme".
           plugins {
               id 'nf-ga4gh'
@@ -135,7 +151,38 @@
           }
 
           tes {
-              endpoint      = '{{ src_tes_endpoint | default("http://localhost:8080") }}'
-              basicUsername = '{{ src_tes_username | default("") }}'
-              basicPassword = '{{ src_tes_password | default("") }}'
+              endpoint      = {{ q(src_tes_endpoint | default("http://localhost:8080")) }}
+              basicUsername = {{ q(src_tes_username | default("")) }}
+              basicPassword = {{ q(src_tes_password | default("")) }}
           }
+          {% if nf_s3_bucket %}
+
+          workDir = 's3://{{ nf_s3_bucket }}/work'
+          {% else %}
+
+          // No S3 bucket configured: launch with an object-store work dir, e.g.
+          //     nextflow run <pipeline> -w s3://<bucket>/work
+          {% endif %}
+          {% set s3_style = src_s3_addressing_style | default('') | trim | lower %}
+          {% set aws_main = [] %}
+          {% if src_s3_access_key_id | default('') %}{% set _ = aws_main.append('accessKey = ' ~ q(src_s3_access_key_id)) %}{% endif %}
+          {% if src_s3_secret_access_key | default('') %}{% set _ = aws_main.append('secretKey = ' ~ q(src_s3_secret_access_key)) %}{% endif %}
+          {% if src_s3_region | default('') %}{% set _ = aws_main.append('region    = ' ~ q(src_s3_region)) %}{% endif %}
+          {% set aws_client = [] %}
+          {% if src_s3_endpoint_url | default('') %}{% set _ = aws_client.append('endpoint          = ' ~ q(src_s3_endpoint_url)) %}{% endif %}
+          {% if s3_style == 'path' %}{% set _ = aws_client.append('s3PathStyleAccess = true') %}{% elif s3_style == 'virtual' %}{% set _ = aws_client.append('s3PathStyleAccess = false') %}{% endif %}
+          {% if aws_main or aws_client %}
+
+          aws {
+          {% for line in aws_main %}
+              {{ line }}
+          {% endfor %}
+          {% if aws_client %}
+              client {
+          {% for line in aws_client %}
+                  {{ line }}
+          {% endfor %}
+              }
+          {% endif %}
+          }
+          {% endif %}
