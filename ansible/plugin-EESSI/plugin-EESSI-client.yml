@@ -62,10 +62,9 @@
   become: yes
   gather_facts: yes
   vars:
-    # SRC parameter behind the catalog item's "S3 bucket resource" field.
-    # The variable name is assumed (not recorded in this repo); rename it here
-    # if the catalog item uses a different one. Accepts `bucket`,
-    # `s3://bucket` or `s3://bucket/`.
+    # SRC parameter behind the catalog item's "S3 bucket resource" field
+    # (same name as in TESP-src). Accepts `bucket`, `s3://bucket` or
+    # `s3://bucket/`.
     nf_s3_bucket_param: "{{ src_s3_bucket | default('') }}"
     nf_s3_bucket: "{{ nf_s3_bucket_param | trim | regex_replace('^s3://', '') | regex_replace('/+$', '') }}"
     # Group allowed to read the generated config when it holds secrets
