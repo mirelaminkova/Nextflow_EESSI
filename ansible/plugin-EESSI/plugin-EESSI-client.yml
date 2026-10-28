@@ -69,8 +69,11 @@
     nf_s3_bucket_param: "{{ src_s3_bucket | default('') }}"
     nf_s3_bucket: "{{ nf_s3_bucket_param | trim | regex_replace('^s3://', '') | regex_replace('/+$', '') }}"
     # Group allowed to read the generated config when it holds secrets
-    # (TES password / S3 keys). Users outside it will not get the config seeded.
-    nf_config_group: root
+    # (TES password / S3 keys). SRC has no fixed group for all workspace users
+    # (CO groups in /etc/rsc/managedgroups vary per CO), so, like the
+    # uusrc.general default_group role, we create one and put every regular
+    # user in it, now and at future logins.
+    nf_config_group: nextflow
     # A single backslash, for escaping values into Groovy '...' strings.
     nf_bs: "\\"
     nf_config_has_secrets: "{{ (src_tes_password | default('')) != '' or (src_s3_access_key_id | default('')) != '' or (src_s3_secret_access_key | default('')) != '' }}"
@@ -110,6 +113,66 @@
         mode: '0755'
         owner: root
         group: root
+
+    # Same steps as the uusrc.general default_group role, inlined so this
+    # plugin needs no extra collection.
+    - name: Ensure Nextflow config group exists
+      group:
+        name: "{{ nf_config_group }}"
+        state: present
+
+    - name: Add the group at every login (pam_group)
+      lineinfile:
+        path: /etc/security/group.conf
+        insertbefore: BOF
+        line: "*;*;*;Al0000-2400;{{ nf_config_group }}"
+
+    - name: Read /etc/passwd
+      no_log: true
+      getent:
+        database: passwd
+
+    - name: Add existing regular users to the Nextflow config group
+      # Regular users as in uusrc.general fact_regular_users: uid > 999,
+      # home under /home/, not the ubuntu user.
+      user:
+        name: "{{ item.key }}"
+        groups: "{{ nf_config_group }}"
+        append: true
+      loop: "{{ getent_passwd | dict2items | selectattr('key', 'ne', 'ubuntu') | list }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - item.value[1] | int > 999
+        - item.value[4] is match('/home/')
+
+    - name: Add new users to the Nextflow config group (adduser)
+      when: ansible_distribution in ['Ubuntu', 'Debian']
+      block:
+        - name: Enable adding extra groups
+          lineinfile:
+            path: /etc/adduser.conf
+            line: 'ADD_EXTRA_GROUPS=1'
+            regexp: '^#?ADD_EXTRA_GROUPS='
+
+        - name: Find EXTRA_GROUPS
+          register: nf_extra_groups
+          command: 'grep "^EXTRA_GROUPS=" /etc/adduser.conf'
+          failed_when: nf_extra_groups.rc == 2
+          changed_when: false
+
+        - name: Add extra groups instruction
+          lineinfile:
+            path: /etc/adduser.conf
+            line: 'EXTRA_GROUPS=""'
+            insertbefore: EOF
+          when: not nf_extra_groups.stdout
+
+        - name: Add the group to EXTRA_GROUPS
+          replace:
+            path: /etc/adduser.conf
+            regexp: '^(?!.*[\s"]+{{ nf_config_group }}[\s"]+)EXTRA_GROUPS="(.*)"'
+            replace: 'EXTRA_GROUPS="{{ nf_config_group }} \1"'
 
     - name: Ensure /etc/nextflow exists
       file:
